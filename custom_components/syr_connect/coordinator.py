@@ -7,7 +7,7 @@ import copy
 import logging
 from collections import defaultdict
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Any, cast
 
 import aiohttp
 from homeassistant.components.recorder.models import (
@@ -225,9 +225,10 @@ class SyrConnectDataUpdateCoordinator(DataUpdateCoordinator):
             # Devices that upload several measurements at once (SafeFloor): import them as
             # long-term statistics in the background, so a slow request never delays the update
             due = [(device, request) for device in all_devices if (request := self._history_request_due(device))]
-            if due and (self._history_task is None or self._history_task.done()):
-                self._history_task = self.hass.async_create_background_task(
-                    self._async_import_device_histories(due), f"{DOMAIN} measurement history"
+            if due and self.config_entry and (self._history_task is None or self._history_task.done()):
+                # Tied to the config entry: cancelled when the entry is unloaded or removed
+                self._history_task = self.config_entry.async_create_background_task(
+                    self.hass, self._async_import_device_histories(due), f"{DOMAIN} measurement history"
                 )
 
             _LOGGER.debug("Update cycle completed: %d device(s) total", len(all_devices))
@@ -356,8 +357,8 @@ class SyrConnectDataUpdateCoordinator(DataUpdateCoordinator):
         Returns:
             The request defined by the device module of the model, or None if nothing is due
         """
-        if "recorder" not in self.hass.config.components:
-            return None  # Long-term statistics are stored by the recorder
+        if isinstance(self.api, SyrConnectJsonAPI) or "recorder" not in self.hass.config.components:
+            return None  # The history comes from the cloud and is stored by the recorder
         status = device.get("status") or {}
         upload = status.get("getSRN_dt")
         if not upload or upload == self._history_imported_uploads.get(device["id"]):
@@ -376,8 +377,7 @@ class SyrConnectDataUpdateCoordinator(DataUpdateCoordinator):
         Args:
             due: Devices including their status, each with the history request of its model
         """
-        if isinstance(self.api, SyrConnectJsonAPI):
-            return  # History requests are cloud API requests
+        api = cast(SyrConnectXmlAPI, self.api)  # History requests are cloud API requests
         # The statistics are named like the sensors, e.g. "Floor sensor Temperature history"
         translations = await async_get_translations(self.hass, self.hass.config.language, "entity", {DOMAIN})
 
@@ -386,9 +386,17 @@ class SyrConnectDataUpdateCoordinator(DataUpdateCoordinator):
             try:
                 for key, measurement_type in request.measurement_types.items():
                     unit = _SYR_CONNECT_SENSOR_UNIT[key]
-                    measurements = await self.api.get_device_history(
+                    measurements = await api.get_device_history(
                         device.get("dclg", device_id), request.url, measurement_type, request.report_type, unit
                     )
+                    # The cloud holds the last 6 days. Anything else (e.g. from a reset sensor
+                    # clock) is ignored, it would fill the statistics with made-up hours.
+                    now = dt_util.utcnow()
+                    oldest, newest = now - timedelta(days=7), now + timedelta(hours=1)  # 1 h clock tolerance
+                    measurements = [(t, v) for t, v in measurements if oldest <= t <= newest]
+                    if not measurements:
+                        # E.g. the upload is not stored yet: try again later instead of skipping it
+                        raise ValueError(f"no {key} measurements")
                     sensor_name = translations.get(f"component.{DOMAIN}.entity.sensor.{key.lower()}.name", key)
                     async_import_history(
                         self.hass,
@@ -397,7 +405,7 @@ class SyrConnectDataUpdateCoordinator(DataUpdateCoordinator):
                         unit,
                         measurements,
                     )
-            except (SyrConnectAuthError, SyrConnectConnectionError, ValueError, HomeAssistantError) as err:
+            except (HomeAssistantError, ValueError) as err:  # includes all SyrConnectError
                 # Warn once, then only debug while the failure persists
                 log = _LOGGER.debug if device_id in self._history_retry_at else _LOGGER.warning
                 self._history_retry_at[device_id] = dt_util.utcnow() + timedelta(

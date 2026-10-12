@@ -116,36 +116,6 @@ def test_cleanup_removed_devices_keeps_current_device() -> None:
     device_registry.async_update_device.assert_not_called()
 
 
-def test_cleanup_removed_devices_clears_statistics_of_deleted_device() -> None:
-    """A device detached from its last config entry is deleted, and so are its statistics."""
-    hass = MagicMock()
-    device_registry = MagicMock()
-    device_registry.async_update_device.return_value = None  # the device was deleted
-    stale_entry = SimpleNamespace(id="registry_entry_id", identifiers={(helpers.DOMAIN, "STALE_DEV")})
-
-    with (
-        patch("custom_components.syr_connect.helpers.dr.async_get", return_value=device_registry),
-        patch(
-            "custom_components.syr_connect.helpers.dr.async_entries_for_config_entry",
-            return_value=[stale_entry],
-        ),
-        patch("custom_components.syr_connect.helpers.async_clear_history_statistics") as mock_clear,
-    ):
-        helpers.cleanup_removed_devices(hass, {"devices": [{"id": "CURRENT_DEV"}]}, "entry1")
-
-    mock_clear.assert_called_once_with(hass, ["STALE_DEV"])
-
-
-def test_cleanup_removed_devices_without_device_list() -> None:
-    """Without a device list (e.g. the cloud failed at startup) nothing is detached or deleted."""
-    hass = MagicMock()
-    with patch("custom_components.syr_connect.helpers.dr.async_get") as mock_get_registry:
-        helpers.cleanup_removed_devices(hass, {"devices": []}, "entry1")
-        helpers.cleanup_removed_devices(hass, None, "entry1")
-
-    mock_get_registry.assert_not_called()
-
-
 def test_async_clear_history_statistics() -> None:
     """The history statistics of all known keys are cleared; nothing without devices or recorder."""
     hass = MagicMock()
@@ -191,7 +161,7 @@ def test_cleanup_removed_devices_handles_exception() -> None:
     hass = MagicMock()
     with patch("custom_components.syr_connect.helpers.dr.async_get", side_effect=RuntimeError("boom")):
         # Should not raise
-        helpers.cleanup_removed_devices(hass, {"devices": [{"id": "CURRENT_DEV"}]}, "entry1")
+        helpers.cleanup_removed_devices(hass, {"devices": []}, "entry1")
 
 
 def test_get_current_mac_priorities_additional():

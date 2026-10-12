@@ -358,8 +358,7 @@ def cleanup_removed_devices(
     because the same physical device can be shared across config entries
     (e.g. visible via two SYR Connect accounts); Home Assistant only fully
     removes the device - cascading its entities - once no config entry
-    references it anymore. The measurement history statistics of a device
-    are deleted together with the device.
+    references it anymore.
 
     Args:
         hass: Home Assistant instance.
@@ -368,12 +367,7 @@ def cleanup_removed_devices(
     """
     try:
         current_ids = {d["id"] for d in (coordinator_data or {}).get("devices", []) if d.get("id")}
-        if not current_ids:
-            # No device list (e.g. the cloud failed at startup): nothing to compare against.
-            # Deleting would remove all devices and their statistics, which can not be restored.
-            return
         device_registry = dr.async_get(hass)
-        deleted_ids = []
         for device_entry in dr.async_entries_for_config_entry(device_registry, entry_id):
             device_id = next(
                 (identifier for domain, identifier in device_entry.identifiers if domain == DOMAIN),
@@ -381,22 +375,20 @@ def cleanup_removed_devices(
             )
             if device_id is not None and device_id not in current_ids:
                 _LOGGER.debug("Removing stale device from registry: %s", device_id)
-                # None: this was the last config entry of the device, so it was deleted
-                if device_registry.async_update_device(device_entry.id, remove_config_entry_id=entry_id) is None:
-                    deleted_ids.append(device_id)
-        async_clear_history_statistics(hass, deleted_ids)
+                device_registry.async_update_device(device_entry.id, remove_config_entry_id=entry_id)
     except Exception:
         _LOGGER.exception("Failed to cleanup removed devices from registry")
 
 
 @callback
 def async_clear_history_statistics(hass: HomeAssistant, device_ids: Iterable[str]) -> None:
-    """Delete the measurement history statistics of deleted devices.
+    """Delete the measurement history statistics of devices.
 
-    Called when a device is deleted (see `cleanup_removed_devices()`) and when
-    the integration is removed, so no statistics are left in the database.
-    The model of a deleted device is unknown, so the IDs of every model's
-    history keys are cleared; IDs without statistics are ignored by the recorder.
+    Called when the integration is removed, so no statistics are left in the
+    database. Not called when `cleanup_removed_devices()` detaches a device:
+    that also happens after a temporary cloud failure, and the history older
+    than 6 days can not be fetched again. The IDs of every model's history keys
+    are cleared; IDs without statistics are ignored by the recorder.
 
     Args:
         hass: Home Assistant instance.
