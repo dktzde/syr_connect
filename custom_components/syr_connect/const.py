@@ -39,7 +39,7 @@ _SYR_CONNECT_API_SCAN_INTERVAL_MAXIMUM = 600  # seconds
 _SYR_CONNECT_SESSION_TIMEOUT_MINUTES = 30
 
 # Measurement history (e.g. SafeFloor): delay before a failed fetch is retried (hours)
-_SYR_CONNECT_API_XML_STATISTICS_RETRY_HOURS = 3
+_SYR_CONNECT_API_XML_STATISTICS_RETRY_HOURS = 12
 
 # API URLs (internal)
 _SYR_CONNECT_API_XML_BASE_URL = "https://syrconnect.de/"

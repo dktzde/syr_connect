@@ -1567,7 +1567,7 @@ async def test_coordinator_history_does_not_delay_the_update(hass: HomeAssistant
 async def test_coordinator_history_failure_is_retried_later(
     hass: HomeAssistant, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A failed fetch keeps the update working, is logged once and retried after 3 hours."""
+    """A failed fetch keeps the update working, is logged once and retried after 12 hours."""
     history = AsyncMock(side_effect=SyrConnectConnectionError("cloud down"))
     coordinator, _ = _history_coordinator(hass, _safefloor_status(), history)
 
@@ -1577,7 +1577,7 @@ async def test_coordinator_history_failure_is_retried_later(
         assert coordinator.data["devices"][0]["status"]["getCEL"] == "158"
         mock_import.assert_not_called()
         retry_in = coordinator._history_retry_at[SAFEFLOOR_SERIAL] - datetime.now(UTC)
-        assert timedelta(hours=2, minutes=59) < retry_in <= timedelta(hours=3)
+        assert timedelta(hours=11, minutes=59) < retry_in <= timedelta(hours=12)
 
         # Within the retry delay nothing is fetched
         await _refresh(hass, coordinator)
