@@ -369,58 +369,63 @@ class SyrConnectDataUpdateCoordinator(DataUpdateCoordinator):
         return get_model_history_request(detect_model(status))  # None for models without history
 
     async def _async_import_device_histories(self, due: list[tuple[dict[str, Any], HistoryRequest]]) -> None:
-        """Fetch the measurement history of devices and import it as long-term statistics.
-
-        Runs as a background task (see _async_update_data). Failures are logged and retried
-        later (see _history_request_due), never raised.
+        """Import the measurement history of devices, as a background task (see _async_update_data).
 
         Args:
             due: Devices including their status, each with the history request of its model
         """
-        api = cast(SyrConnectXmlAPI, self.api)  # History requests are cloud API requests
         # The statistics are named like the sensors, e.g. "Floor sensor Temperature history"
         translations = await async_get_translations(self.hass, self.hass.config.language, "entity", {DOMAIN})
-
         for device, request in due:
-            device_id = device["id"]
+            await self._async_import_device_history(device, request, translations)
+
+    async def _async_import_device_history(
+        self, device: dict[str, Any], request: HistoryRequest, translations: dict[str, str]
+    ) -> None:
+        """Fetch the measurement history of a device and import it as long-term statistics.
+
+        A failed fetch is logged and retried later (see _history_request_due), never raised.
+
+        Args:
+            device: Device dictionary including its status
+            request: History request of the model
+            translations: Entity translations, for the statistic names
+        """
+        api = cast(SyrConnectXmlAPI, self.api)  # History requests are cloud API requests
+        device_id = device["id"]
+        # The cloud holds the last 6 days. Measurements outside (e.g. from a reset sensor clock)
+        # are ignored, they would fill the statistics with made-up hours.
+        newest = dt_util.utcnow()
+        oldest = newest - timedelta(days=7)
+
+        for key, measurement_type in request.measurement_types.items():
+            unit = _SYR_CONNECT_SENSOR_UNIT[key]
             try:
-                for key, measurement_type in request.measurement_types.items():
-                    unit = _SYR_CONNECT_SENSOR_UNIT[key]
-                    measurements = await api.get_device_history(
-                        device.get("dclg", device_id), request.url, measurement_type, request.report_type, unit
-                    )
-                    # The cloud holds the last 6 days. Anything else (e.g. from a reset sensor
-                    # clock) is ignored, it would fill the statistics with made-up hours.
-                    now = dt_util.utcnow()
-                    oldest, newest = now - timedelta(days=7), now + timedelta(hours=1)  # 1 h clock tolerance
-                    measurements = [(t, v) for t, v in measurements if oldest <= t <= newest]
-                    if not measurements:
-                        # E.g. the upload is not stored yet: try again later instead of skipping it
-                        raise ValueError(f"no {key} measurements")
-                    sensor_name = translations.get(f"component.{DOMAIN}.entity.sensor.{key.lower()}.name", key)
-                    async_import_history(
-                        self.hass,
-                        build_statistic_id(device_id, key),
-                        f"{device.get('name') or device_id} {sensor_name} history",
-                        unit,
-                        measurements,
-                    )
+                measurements = await api.get_device_history(
+                    device.get("dclg", device_id), request.url, measurement_type, request.report_type, unit
+                )
             except (HomeAssistantError, ValueError) as err:  # includes all SyrConnectError
                 # Warn once, then only debug while the failure persists
                 log = _LOGGER.debug if device_id in self._history_retry_at else _LOGGER.warning
-                self._history_retry_at[device_id] = dt_util.utcnow() + timedelta(
-                    hours=_SYR_CONNECT_API_XML_STATISTICS_RETRY_HOURS
-                )
+                self._history_retry_at[device_id] = newest + timedelta(hours=_SYR_CONNECT_API_XML_STATISTICS_RETRY_HOURS)
                 log(
-                    "Device %s: failed to import the measurement history, retrying in %d hours: %s",
+                    "Device %s: failed to fetch the measurement history, retrying in %d hours: %s",
                     device_id,
                     _SYR_CONNECT_API_XML_STATISTICS_RETRY_HOURS,
                     err,
                 )
-                continue
+                return
+            sensor_name = translations.get(f"component.{DOMAIN}.entity.sensor.{key.lower()}.name", key)
+            async_import_history(
+                self.hass,
+                build_statistic_id(device_id, key),
+                f"{device.get('name') or device_id} {sensor_name} history",
+                unit,
+                [(t, v) for t, v in measurements if oldest <= t <= newest],
+            )
 
-            self._history_imported_uploads[device_id] = device["status"]["getSRN_dt"]
-            self._history_retry_at.pop(device_id, None)
+        self._history_imported_uploads[device_id] = device["status"]["getSRN_dt"]
+        self._history_retry_at.pop(device_id, None)
 
     def _get_device_dclg_from_srn(self, device_id: str) -> str | None:
         """Return the DCLG (Device Collection Group UUID) for the given device serial number.

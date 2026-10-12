@@ -1533,7 +1533,7 @@ async def test_coordinator_history_imported_once_per_upload(hass: HomeAssistant)
 async def test_coordinator_history_ignores_implausible_timestamps(hass: HomeAssistant) -> None:
     """Measurements outside the cloud window (e.g. from a reset sensor clock) are not imported."""
     recent = (_recent(hours=2), 15.8)
-    history = AsyncMock(return_value=[(_utc("2000-01-01 00:00:00"), 0.0), recent, (_recent(hours=-3), 1.0)])
+    history = AsyncMock(return_value=[(_utc("2000-01-01 00:00:00"), 0.0), recent, (_recent(hours=-1), 1.0)])
     coordinator, _ = _history_coordinator(hass, _safefloor_status(), history)
 
     with patch("custom_components.syr_connect.coordinator.async_import_history") as mock_import:
@@ -1564,15 +1564,11 @@ async def test_coordinator_history_does_not_delay_the_update(hass: HomeAssistant
     assert coordinator._history_imported_uploads == {SAFEFLOOR_SERIAL: UPLOAD_1}
 
 
-@pytest.mark.parametrize(
-    "history",
-    [AsyncMock(side_effect=SyrConnectConnectionError("cloud down")), AsyncMock(return_value=[])],
-    ids=["connection_error", "no_measurements"],
-)
 async def test_coordinator_history_failure_is_retried_later(
-    hass: HomeAssistant, caplog: pytest.LogCaptureFixture, history: AsyncMock
+    hass: HomeAssistant, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A failed or empty fetch keeps the update working, is logged once and retried after 3 hours."""
+    """A failed fetch keeps the update working, is logged once and retried after 3 hours."""
+    history = AsyncMock(side_effect=SyrConnectConnectionError("cloud down"))
     coordinator, _ = _history_coordinator(hass, _safefloor_status(), history)
 
     with patch("custom_components.syr_connect.coordinator.async_import_history") as mock_import:
@@ -1596,7 +1592,7 @@ async def test_coordinator_history_failure_is_retried_later(
 
         # Success
         history.side_effect = None
-        history.return_value = [(_recent(hours=2), 15.8)]
+        history.return_value = []
         coordinator._history_retry_at[SAFEFLOOR_SERIAL] = datetime.now(UTC) - timedelta(seconds=1)
         await _refresh(hass, coordinator)
         assert history.await_count == 4
