@@ -4,14 +4,17 @@ from __future__ import annotations
 import ipaddress
 import logging
 import re
+from collections.abc import Iterable
 from types import ModuleType
 from typing import Any
 
+from homeassistant.components.recorder import get_instance
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.device_registry import DeviceInfo
+from homeassistant.util import slugify
 
 from .const import (
     _SYR_CONNECT_API_JSON_SCAN_INTERVAL_DEFAULT,
@@ -70,6 +73,13 @@ _DEVICE_MODULES: dict[str, ModuleType] = {
     "safetechplus": safetechplus,
     "safetplus": safetplus,
     "trio": trio,
+}
+
+# Sensor keys with a measurement history in any device module (see devices/__init__.py)
+_HISTORY_KEYS: set[str] = {
+    key
+    for device_module in _DEVICE_MODULES.values()
+    for key in getattr(device_module, "_SYR_CONNECT_API_XML_DEVICE_GET_STATISTICS_TYPES", {})
 }
 
 
@@ -254,6 +264,36 @@ def build_unique_id(entry_id: str | None, device_id: str, key: str) -> str:
     return f"{device_id}_{key}"
 
 
+def build_statistic_id(device_id: str, key: str) -> str:
+    """Build the ID of the measurement history statistic of a sensor.
+
+    External statistics are named "<domain>:<object_id>"; the colon is mandatory
+    (entity-like IDs such as "syr_connect_..." are reserved for statistics of
+    entities). Example: "syr_connect:203406210_getcel_history".
+
+    Args:
+        device_id: Device ID (serial number)
+        key: Sensor key (e.g. "getCEL")
+
+    Returns:
+        Formatted statistic ID
+    """
+    return f"{DOMAIN}:{slugify(f'{device_id}_{key}_history')}"
+
+
+def get_model_device_module(model_info: dict[str, Any]) -> ModuleType | None:
+    """Return the `devices/<name>.py` module of the detected model, or None if it has none.
+
+    The module is selected by the model's `device_file`, or its `name` when
+    `device_file` is not set (see `models.MODEL_SIGNATURES`).
+
+    Args:
+        model_info: Result of `models.detect_model()`.
+    """
+    name = model_info.get("device_file") or model_info.get("name")
+    return _DEVICE_MODULES.get(name) if name else None
+
+
 def get_model_known_keys(model_info: dict[str, Any], platform: str, global_known_keys: set[str]) -> set[str]:
     """Return the known-keys allowlist for a platform, scoped to the detected model.
 
@@ -281,13 +321,7 @@ def get_model_known_keys(model_info: dict[str, Any], platform: str, global_known
     Returns:
         The effective allowlist to use for this device.
     """
-    name = model_info.get("device_file") or model_info.get("name")
-    if not name:
-        return global_known_keys
-    device_module = _DEVICE_MODULES.get(name)
-    if device_module is None:
-        return global_known_keys
-    device_keys = getattr(device_module, f"{platform.upper()}_KNOWN_KEYS", None)
+    device_keys = getattr(get_model_device_module(model_info), f"{platform.upper()}_KNOWN_KEYS", None)
     # None means "not defined" -> fall back. An explicit empty set is a valid
     # override meaning "this model has none of this platform's entities".
     if device_keys is None:
@@ -313,7 +347,8 @@ def cleanup_removed_devices(
     because the same physical device can be shared across config entries
     (e.g. visible via two SYR Connect accounts); Home Assistant only fully
     removes the device - cascading its entities - once no config entry
-    references it anymore.
+    references it anymore. The measurement history statistics of a device
+    are deleted together with the device.
 
     Args:
         hass: Home Assistant instance.
@@ -323,6 +358,7 @@ def cleanup_removed_devices(
     try:
         current_ids = {d["id"] for d in (coordinator_data or {}).get("devices", []) if d.get("id")}
         device_registry = dr.async_get(hass)
+        deleted_ids = []
         for device_entry in dr.async_entries_for_config_entry(device_registry, entry_id):
             device_id = next(
                 (identifier for domain, identifier in device_entry.identifiers if domain == DOMAIN),
@@ -330,9 +366,31 @@ def cleanup_removed_devices(
             )
             if device_id is not None and device_id not in current_ids:
                 _LOGGER.debug("Removing stale device from registry: %s", device_id)
-                device_registry.async_update_device(device_entry.id, remove_config_entry_id=entry_id)
+                # None: this was the last config entry of the device, so it was deleted
+                if device_registry.async_update_device(device_entry.id, remove_config_entry_id=entry_id) is None:
+                    deleted_ids.append(device_id)
+        async_clear_history_statistics(hass, deleted_ids)
     except Exception:
         _LOGGER.exception("Failed to cleanup removed devices from registry")
+
+
+@callback
+def async_clear_history_statistics(hass: HomeAssistant, device_ids: Iterable[str]) -> None:
+    """Delete the measurement history statistics of deleted devices.
+
+    Called when a device is deleted (see `cleanup_removed_devices()`) and when
+    the integration is removed, so no statistics are left in the database.
+    The model of a deleted device is unknown, so the IDs of every model's
+    history keys are cleared; IDs without statistics are ignored by the recorder.
+
+    Args:
+        hass: Home Assistant instance.
+        device_ids: Device IDs (serial numbers) of the deleted devices.
+    """
+    statistic_ids = [build_statistic_id(device_id, key) for device_id in device_ids for key in _HISTORY_KEYS]
+    if statistic_ids and "recorder" in hass.config.components:
+        _LOGGER.debug("Clearing measurement history statistics: %s", statistic_ids)
+        get_instance(hass).async_clear_statistics(statistic_ids)
 
 
 def registry_cleanup(

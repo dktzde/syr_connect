@@ -61,3 +61,18 @@ BUTTON_KNOWN_KEYS = {
 
 # No shutoff valve on this model (a standalone sensor, not a valve controller).
 VALVE_KNOWN_KEYS: set[str] = set()
+
+# --- Measurement history ---
+#
+# SafeFloor sensors measure every getWMP seconds but upload to the cloud only every getRCP seconds
+# (e.g. every 4 days), so the status only carries the latest measurement. GetSafeFloorStatistics
+# returns the raw measurements of the last 6 days, which the coordinator imports as long-term
+# statistics (see docs/syrconnect-protocol.md, "SafeFloor measurement history").
+_SYR_CONNECT_API_XML_DEVICE_GET_STATISTICS_URL = "WebServices/SyrControlWebServiceTest2.asmx/GetSafeFloorStatistics"
+# Report type "rtyp": 4 = raw measurements with timestamps (1-3 are week/month/year aggregates)
+_SYR_CONNECT_API_XML_DEVICE_GET_STATISTICS_REPORT_TYPE = 4
+# Sensor key -> measurement type "t". The unit comes from _SYR_CONNECT_SENSOR_UNIT.
+_SYR_CONNECT_API_XML_DEVICE_GET_STATISTICS_TYPES = {
+    "getCEL": 1,  # Temperature
+    "getHMD": 2,  # Humidity
+}

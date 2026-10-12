@@ -9,6 +9,7 @@ import pytest
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.helpers import device_registry as dr
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.syr_connect import (
@@ -16,6 +17,7 @@ from custom_components.syr_connect import (
     async_migrate_entry,
     async_options_update_listener,
     async_reload_entry,
+    async_remove_entry,
     async_setup_entry,
     async_unload_entry,
 )
@@ -632,3 +634,20 @@ async def test_async_setup_entry_skips_migration_for_new_entries(hass: HomeAssis
     # Verify migration was NOT called (entry already has API_TYPE)
     mock_update.assert_not_called()
 
+
+
+async def test_async_remove_entry_clears_statistics_of_removed_devices(hass: HomeAssistant) -> None:
+    """Removing an entry clears the statistics of its devices, except devices shared with another entry."""
+    entry = MockConfigEntry(domain=DOMAIN, entry_id="entry1", data={})
+    other_entry = MockConfigEntry(domain=DOMAIN, entry_id="entry2", data={})
+    entry.add_to_hass(hass)
+    other_entry.add_to_hass(hass)
+    device_registry = dr.async_get(hass)
+    device_registry.async_get_or_create(config_entry_id="entry1", identifiers={(DOMAIN, "ONLY_ENTRY1")})
+    device_registry.async_get_or_create(config_entry_id="entry1", identifiers={(DOMAIN, "SHARED")})
+    device_registry.async_get_or_create(config_entry_id="entry2", identifiers={(DOMAIN, "SHARED")})
+
+    with patch("custom_components.syr_connect.async_clear_history_statistics") as mock_clear:
+        await async_remove_entry(hass, entry)
+
+    mock_clear.assert_called_once_with(hass, ["ONLY_ENTRY1"])

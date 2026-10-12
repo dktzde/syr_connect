@@ -408,3 +408,16 @@ def test_compute_local_tzo_fallback_extra(monkeypatch) -> None:
     pb = PayloadBuilder("1.0.0", checksum)
 
     assert pb._compute_local_tzo() == "+00:00:00"
+
+
+def test_build_device_get_history_payload() -> None:
+    """The history request asks for one measurement in the app language, escaped and with checksum."""
+    fake_checksum = MagicMock()
+    fake_checksum.compute_xml_checksum.return_value = "CHK"
+    pb = PayloadBuilder("1.2.3", fake_checksum)
+
+    payload = pb.build_device_get_history_payload("s&1", "dev<1>", 1, 4, "°C")
+
+    assert '<us ug="s&amp;1"/>' in payload
+    assert '<col><dcl dclg="dev&lt;1&gt;"><sh t="1" rtyp="4" lg="de" rg="DE" unit="°C"/></dcl></col>' in payload
+    assert payload.endswith('<cs v="CHK"/></sc>')

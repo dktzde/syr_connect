@@ -17,9 +17,14 @@ def setup_in_progress_config_entry():
 
 
 @pytest.fixture(autouse=True)
-def auto_enable_custom_integrations(enable_custom_integrations):
-    """Enable custom integrations for all tests."""
-    return enable_custom_integrations
+def auto_enable_custom_integrations(request: pytest.FixtureRequest) -> None:
+    """Enable custom integrations for all tests.
+
+    Tests with a real recorder (`recorder_mock`) need its database before hass is set up.
+    """
+    if "recorder_mock" in request.fixturenames:
+        request.getfixturevalue("recorder_db_url")
+    request.getfixturevalue("enable_custom_integrations")
 
 
 @pytest.fixture(autouse=True)

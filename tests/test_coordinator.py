@@ -1,11 +1,23 @@
 """Test the SYR Connect coordinator."""
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from freezegun.api import FrozenDateTimeFactory
+from homeassistant.components.recorder import Recorder, get_instance
+from homeassistant.components.recorder.models import StatisticMeanType
+from homeassistant.components.recorder.statistics import statistics_during_period
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady, HomeAssistantError
 from homeassistant.helpers.update_coordinator import UpdateFailed
+from homeassistant.setup import async_setup_component
+from pytest_homeassistant_custom_component.components.recorder.common import (
+    async_recorder_block_till_done,
+    async_wait_recording_done,
+    do_adhoc_statistics,
+)
 
 from custom_components.syr_connect.api_json import SyrConnectJsonAPI
 from custom_components.syr_connect.const import (
@@ -17,11 +29,16 @@ from custom_components.syr_connect.const import (
     CONF_MODEL,
     CONF_SERVICE,
 )
-from custom_components.syr_connect.coordinator import SyrConnectDataUpdateCoordinator
+from custom_components.syr_connect.coordinator import (
+    SyrConnectDataUpdateCoordinator,
+    async_import_history,
+    hourly_statistics,
+)
 from custom_components.syr_connect.exceptions import (
     SyrConnectAuthError,
     SyrConnectConnectionError,
 )
+from custom_components.syr_connect.response_parser import ResponseParser
 
 
 def _consume_coro_return_task(coro):
@@ -1419,3 +1436,262 @@ async def test_coordinator_init_xml_api_with_conf_service(hass: HomeAssistant) -
         assert call_kwargs["api_app_name"] == svc["api_app_name"]
         assert call_kwargs["api_base_url"] == svc["api_base_url"]
         assert call_kwargs["cf_bundle_identifier"] == svc["cf_bundle_identifier"]
+
+
+# --- Measurement history (SafeFloor) -----------------------------------------------------------
+
+SAFEFLOOR_SERIAL = "123456789"
+SAFEFLOOR_DCLG = "7605aa61-73b8-ef11-800c-be3af2b6059f"
+SAFEFLOOR_STATISTICS_URL = "WebServices/SyrControlWebServiceTest2.asmx/GetSafeFloorStatistics"
+SAFEFLOOR_TEMPERATURE_XML = (
+    Path(__file__).parent / "fixtures/xml/SyrSafeFloor_GetSafeFloorStatistics_Temperature.xml"
+).read_text(encoding="utf-8")
+TEMPERATURE_STATISTIC_ID = "syr_connect:123456789_getcel_history"
+UPLOAD_1 = "28.09.2026 14:55:43"
+UPLOAD_2 = "02.10.2026 14:55:40"
+
+
+def _utc(text: str) -> datetime:
+    return datetime.strptime(text, "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
+
+
+def _safefloor_status(upload: str | None = UPLOAD_1) -> dict:
+    status = {"getSRN": SAFEFLOOR_SERIAL, "getVER": "Syr Floorsensor 2.23", "getCEL": "158", "getHMD": "81", "dst": "3"}
+    if upload is not None:
+        status["getSRN_dt"] = upload
+    return status
+
+
+def _history_coordinator(
+    hass: HomeAssistant, entry, status: dict, history: AsyncMock, recorder: bool = True
+) -> tuple[SyrConnectDataUpdateCoordinator, MagicMock]:
+    """Return a coordinator for one device (XML API) whose history requests go to `history`."""
+    if recorder:
+        hass.config.components.add("recorder")
+    with patch("custom_components.syr_connect.coordinator.SyrConnectXmlAPI") as mock_api_class:
+        mock_api = mock_api_class.return_value
+        mock_api.projects = [{"id": "project1", "name": "Test Project"}]
+        mock_api.is_session_valid = MagicMock(return_value=True)
+        mock_api.get_devices = AsyncMock(
+            side_effect=lambda _project_id: [{"id": SAFEFLOOR_SERIAL, "dclg": SAFEFLOOR_DCLG, "name": "Floor"}]
+        )
+        mock_api.get_device_status = AsyncMock(return_value=status)
+        mock_api.get_device_history = history
+        coordinator = SyrConnectDataUpdateCoordinator(
+            hass, MagicMock(), {CONF_USERNAME: "test@example.com", CONF_PASSWORD: "password"}, 60
+        )
+    coordinator.config_entry = entry
+    return coordinator, mock_api
+
+
+async def test_coordinator_history_imported_once_per_upload(
+    hass: HomeAssistant, setup_in_progress_config_entry
+) -> None:
+    """The history is fetched after the start and then only when getSRN_dt changes."""
+    measurements = [(_utc("2026-09-28 14:45:27"), 15.8)]
+    history = AsyncMock(return_value=measurements)
+    coordinator, mock_api = _history_coordinator(hass, setup_in_progress_config_entry, _safefloor_status(), history)
+
+    with patch("custom_components.syr_connect.coordinator.async_import_history") as mock_import:
+        await coordinator.async_config_entry_first_refresh()
+        assert [c.args for c in history.await_args_list] == [
+            (SAFEFLOOR_DCLG, SAFEFLOOR_STATISTICS_URL, 1, 4, "°C"),
+            (SAFEFLOOR_DCLG, SAFEFLOOR_STATISTICS_URL, 2, 4, "%"),
+        ]
+        assert [c.args[1:] for c in mock_import.call_args_list] == [
+            (TEMPERATURE_STATISTIC_ID, "Floor Temperature history", "°C", measurements),
+            ("syr_connect:123456789_gethmd_history", "Floor Humidity history", "%", measurements),
+        ]
+
+        # Same upload: nothing is fetched
+        await coordinator.async_refresh()
+        assert history.await_count == 2
+
+        # New upload: fetched again
+        mock_api.get_device_status.return_value = _safefloor_status(UPLOAD_2)
+        await coordinator.async_refresh()
+        assert history.await_count == 4
+        assert coordinator.last_update_success
+
+
+async def test_coordinator_history_failure_is_retried_later(
+    hass: HomeAssistant, setup_in_progress_config_entry
+) -> None:
+    """A failed fetch keeps the update working and is retried after 3 hours."""
+    history = AsyncMock(side_effect=SyrConnectConnectionError("cloud down"))
+    coordinator, _ = _history_coordinator(hass, setup_in_progress_config_entry, _safefloor_status(), history)
+
+    with patch("custom_components.syr_connect.coordinator.async_import_history") as mock_import:
+        await coordinator.async_config_entry_first_refresh()
+        assert coordinator.last_update_success
+        assert coordinator.data["devices"][0]["status"]["getCEL"] == "158"
+        mock_import.assert_not_called()
+        retry_in = coordinator._history_retry_at[SAFEFLOOR_SERIAL] - datetime.now(UTC)
+        assert timedelta(hours=2, minutes=59) < retry_in <= timedelta(hours=3)
+
+        # Within the retry delay nothing is fetched
+        await coordinator.async_refresh()
+        assert history.await_count == 1
+
+        # After the retry delay it is fetched again
+        history.side_effect = None
+        history.return_value = []
+        coordinator._history_retry_at[SAFEFLOOR_SERIAL] = datetime.now(UTC) - timedelta(seconds=1)
+        await coordinator.async_refresh()
+        assert history.await_count == 3
+        assert coordinator._history_retry_at == {}
+        assert coordinator._history_imported_uploads == {SAFEFLOOR_SERIAL: UPLOAD_1}
+
+
+@pytest.mark.parametrize(
+    ("status", "recorder"),
+    [
+        ({"getSRN": "210AAA12345", "getPRS": "50"}, True),
+        ({}, True),
+        (_safefloor_status(upload=None), True),
+        (_safefloor_status(), False),
+    ],
+    ids=["no_safefloor", "empty_status", "no_upload_timestamp", "no_recorder"],
+)
+async def test_coordinator_history_not_fetched(
+    hass: HomeAssistant, setup_in_progress_config_entry, status: dict, recorder: bool
+) -> None:
+    """Other models, a status without upload timestamp or a missing recorder: no request, no error."""
+    history = AsyncMock(return_value=[])
+    coordinator, _ = _history_coordinator(hass, setup_in_progress_config_entry, status, history, recorder)
+
+    await coordinator.async_config_entry_first_refresh()
+
+    assert coordinator.last_update_success
+    history.assert_not_awaited()
+
+
+async def test_coordinator_history_not_fetched_for_json_api(
+    hass: HomeAssistant, setup_in_progress_config_entry
+) -> None:
+    """The local JSON API has no history request."""
+    coordinator, _ = _history_coordinator(hass, setup_in_progress_config_entry, _safefloor_status(), AsyncMock())
+    coordinator.api = MagicMock(spec=SyrConnectJsonAPI)
+
+    await coordinator._async_update_device_history(
+        {"id": SAFEFLOOR_SERIAL, "name": "Floor", "status": _safefloor_status()}
+    )
+
+    assert coordinator._history_imported_uploads == {}
+
+
+def _row(start: str, mean: float, low: float, high: float) -> dict:
+    return {"start": _utc(start), "mean": pytest.approx(mean), "min": low, "max": high}
+
+
+def test_hourly_statistics_repeats_the_hour_before() -> None:
+    """Every hour from the first to the last measurement gets a row; hours without one repeat the hour before."""
+    rows = hourly_statistics([(_utc("2026-09-26 20:45:27"), 14.9), (_utc("2026-09-26 14:45:27"), 14.6)])
+
+    assert [row["start"].hour for row in rows] == list(range(14, 21))
+    assert rows[0] == _row("2026-09-26 14:00:00", 14.6, 14.6, 14.6)
+    assert rows[5] == _row("2026-09-26 19:00:00", 14.6, 14.6, 14.6)
+    assert rows[6] == _row("2026-09-26 20:00:00", 14.9, 14.9, 14.9)
+
+
+def test_hourly_statistics_several_measurements_within_an_hour() -> None:
+    """Measurements of the same hour are combined into mean, min and max."""
+    rows = hourly_statistics([
+        (_utc("2026-09-26 14:05:00"), 14.0),
+        (_utc("2026-09-26 14:35:00"), 16.0),
+        (_utc("2026-09-26 15:10:00"), 18.0),
+    ])
+
+    assert rows == [_row("2026-09-26 14:00:00", 15.0, 14.0, 16.0), _row("2026-09-26 15:00:00", 18.0, 18.0, 18.0)]
+    assert hourly_statistics([]) == []
+
+
+def test_import_history_metadata(hass: HomeAssistant) -> None:
+    """Metadata describes an external mean statistic with unit and unit class; nothing without measurements."""
+    measurements = ResponseParser.parse_device_history_response(SAFEFLOOR_TEMPERATURE_XML)
+
+    with patch("custom_components.syr_connect.coordinator.async_add_external_statistics") as mock_add:
+        async_import_history(hass, TEMPERATURE_STATISTIC_ID, "Floor Temperature history", "°C", [])
+        mock_add.assert_not_called()
+        async_import_history(hass, TEMPERATURE_STATISTIC_ID, "Floor Temperature history", "°C", measurements)
+
+    _, metadata, statistics = mock_add.call_args.args
+    assert metadata == {
+        "has_sum": False,
+        "mean_type": StatisticMeanType.ARITHMETIC,
+        "name": "Floor Temperature history",
+        "source": "syr_connect",
+        "statistic_id": TEMPERATURE_STATISTIC_ID,
+        "unit_class": "temperature",
+        "unit_of_measurement": "°C",
+    }
+    # 26.09. 14:00 (first measurement) to 28.09. 14:00 (last measurement)
+    assert len(statistics) == 49
+
+
+async def _hourly_means(hass: HomeAssistant, statistic_id: str, start: datetime) -> list[tuple[str, float]]:
+    stats = await get_instance(hass).async_add_executor_job(
+        statistics_during_period, hass, start, None, {statistic_id}, "hour", None, {"mean"}
+    )
+    return [
+        (datetime.fromtimestamp(row["start"], UTC).strftime("%d. %H:%M"), round(row["mean"], 3))
+        for row in stats.get(statistic_id, [])
+    ]
+
+
+async def test_import_history_into_recorder(recorder_mock: Recorder, hass: HomeAssistant) -> None:
+    """The measurements end up in the long-term statistics, importing the same days again adds no rows."""
+    measurements = ResponseParser.parse_device_history_response(SAFEFLOOR_TEMPERATURE_XML)
+
+    async_import_history(hass, TEMPERATURE_STATISTIC_ID, "Floor Temperature history", "°C", measurements)
+    async_import_history(hass, TEMPERATURE_STATISTIC_ID, "Floor Temperature history", "°C", measurements)
+    await async_wait_recording_done(hass)
+
+    rows = await _hourly_means(hass, TEMPERATURE_STATISTIC_ID, _utc("2026-09-26 00:00:00"))
+    assert len(rows) == 49
+    assert rows[0] == ("26. 14:00", 14.6)
+    assert rows[5] == ("26. 19:00", 14.6)
+    assert rows[6] == ("26. 20:00", 14.9)
+    assert rows[-1] == ("28. 14:00", 15.8)
+
+
+async def test_import_history_does_not_interfere_with_the_recorder(
+    recorder_mock: Recorder,
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """External statistics can be written for an hour the recorder has not compiled yet.
+
+    This is why the history is not written into the statistics of the sensor entities:
+    the recorder compiles each of their hours exactly once and would fail for an hour
+    that already has a row.
+    """
+    entity_id = "sensor.floor_temperature"
+    attributes = {"device_class": "temperature", "state_class": "measurement", "unit_of_measurement": "°C"}
+    await async_setup_component(hass, "sensor", {})
+    await async_recorder_block_till_done(hass)
+    freezer.move_to(_utc("2026-10-02 10:00:00"))
+    hass.states.async_set(entity_id, "15.0", attributes)
+    await async_wait_recording_done(hass)
+
+    # Upload at 11:20: its measurements reach into the running hour 11:00
+    freezer.move_to(_utc("2026-10-02 11:20:00"))
+    measurements = [(_utc("2026-10-02 09:00:00"), 16.0), (_utc("2026-10-02 11:10:00"), 18.0)]
+    async_import_history(hass, TEMPERATURE_STATISTIC_ID, "Floor Temperature history", "°C", measurements)
+    await async_wait_recording_done(hass)
+
+    # Afterwards the recorder compiles 10:00 and 11:00 of the sensor
+    freezer.move_to(_utc("2026-10-02 12:00:00"))
+    for minutes in range(0, 120, 5):
+        do_adhoc_statistics(hass, start=_utc("2026-10-02 10:00:00") + timedelta(minutes=minutes))
+    await async_wait_recording_done(hass)
+
+    start = _utc("2026-10-02 00:00:00")
+    assert await _hourly_means(hass, entity_id, start) == [("02. 10:00", 15.0), ("02. 11:00", 15.0)]
+    assert await _hourly_means(hass, TEMPERATURE_STATISTIC_ID, start) == [
+        ("02. 09:00", 16.0),
+        ("02. 10:00", 16.0),
+        ("02. 11:00", 18.0),
+    ]
+    assert "Blocked attempt to insert duplicated statistic rows" not in caplog.text

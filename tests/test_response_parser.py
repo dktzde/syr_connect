@@ -1,4 +1,5 @@
 import os
+from datetime import UTC, datetime
 
 import defusedxml.ElementTree as ElementTree
 import pytest
@@ -8,6 +9,8 @@ from custom_components.syr_connect.response_parser import ResponseParser
 FIXTURE_PATH_10S_PROJECT_COLLECTIONS = os.path.join(os.path.dirname(__file__), "fixtures/xml", "SyrLEXplus10S_GetProjectDeviceCollections.xml")
 FIXTURE_PATH_10S_DEVICE_STATUS = os.path.join(os.path.dirname(__file__), "fixtures/xml", "SyrLEXplus10S_GetDeviceCollectionStatus.xml")
 FIXTURE_PATH_10SL_DEVICE_STATUS = os.path.join(os.path.dirname(__file__), "fixtures/xml", "SyrLEXplus10SL_GetDeviceCollectionStatus.xml")
+FIXTURE_PATH_SAFEFLOOR_TEMPERATURE = os.path.join(os.path.dirname(__file__), "fixtures/xml", "SyrSafeFloor_GetSafeFloorStatistics_Temperature.xml")
+FIXTURE_PATH_SAFEFLOOR_HUMIDITY = os.path.join(os.path.dirname(__file__), "fixtures/xml", "SyrSafeFloor_GetSafeFloorStatistics_Humidity.xml")
 
 @pytest.fixture
 def parser():
@@ -858,3 +861,57 @@ def test_parse_device_status_shadow_values(parser):
     assert result["getMXT"] == "490"
     # Key without 's' uses 'v' as before
     assert result["getFLO"] == "10"
+
+
+def _utc(text: str) -> datetime:
+    return datetime.strptime(text, "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
+
+
+@pytest.mark.parametrize(
+    ("fixture_path", "first", "last"),
+    [
+        (FIXTURE_PATH_SAFEFLOOR_TEMPERATURE, ("2026-09-26 14:45:27", 14.6), ("2026-09-28 14:45:27", 15.8)),
+        (FIXTURE_PATH_SAFEFLOOR_HUMIDITY, ("2026-09-26 14:45:27", 75.0), ("2026-09-28 14:45:27", 81.0)),
+    ],
+    ids=["temperature", "humidity"],
+)
+def test_parse_device_history_response(fixture_path, first, last):
+    """Raw measurements are returned as (UTC timestamp, value) tuples sorted by timestamp."""
+    with open(fixture_path, encoding="utf-8") as f:
+        result = ResponseParser.parse_device_history_response(f.read())
+
+    assert len(result) == 9
+    assert result[0] == (_utc(first[0]), first[1])
+    assert result[-1] == (_utc(last[0]), last[1])
+    assert result == sorted(result)
+
+
+def test_parse_device_history_response_empty():
+    """A request without unit returns an empty collection."""
+    assert ResponseParser.parse_device_history_response('<sc><col /><cs v="0" /></sc>') == []
+
+
+def test_parse_device_history_response_errors():
+    """An API error message (e.g. unknown device) and invalid XML raise ValueError."""
+    with pytest.raises(ValueError, match="An error has occurred"):
+        ResponseParser.parse_device_history_response('<sc><msg v="An error has occurred." hl="Error" mtid="1" /></sc>')
+    with pytest.raises(ValueError, match="Invalid XML"):
+        ResponseParser.parse_device_history_response("<sc><col>")
+
+
+def test_parse_device_history_response_skips_invalid_entries():
+    """Entries with missing or invalid timestamp or value are skipped, decimal commas are accepted."""
+    xml = (
+        "<sc><col><dcl><sh><sths>"
+        '<sth dt="2026-09-27 02:45:27" v="15,1" />'
+        '<sth dt="2026-09-26 20:45:27" v="" />'
+        '<sth dt="invalid" v="14.0" />'
+        '<sth v="14.0" />'
+        '<sth dt="2026-09-26 14:45:27" v="nan" />'
+        '<sth dt="2026-09-26 08:45:27" v="14.2" />'
+        "</sths></sh></dcl></col></sc>"
+    )
+    assert ResponseParser.parse_device_history_response(xml) == [
+        (_utc("2026-09-26 08:45:27"), 14.2),
+        (_utc("2026-09-27 02:45:27"), 15.1),
+    ]

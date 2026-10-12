@@ -9,6 +9,7 @@ from xml.sax.saxutils import escape
 from .checksum import SyrChecksum
 from .const import (
     _SYR_CONNECT_CLIENT_CF_BUNDLE_VERSION,
+    _SYR_CONNECT_CLIENT_OS_LANGUAGE,
     _SYR_CONNECT_CLIENT_OS_MODEL,
     _SYR_CONNECT_CLIENT_OS_NAME,
     _SYR_CONNECT_CLIENT_OS_VERSION,
@@ -213,36 +214,34 @@ class PayloadBuilder:
         payload = base_payload.replace('></dcl>', f'>{stat_payload}</dcl>')
         return self._add_checksum(payload)
 
-    def build_safefloor_statistics_payload(
+    def build_device_get_history_payload(
         self,
         session_id: str,
         device_id: str,
         measurement_type: int,
-        unit: str,
         report_type: int,
+        unit: str,
     ) -> str:
-        """Build SafeFloor statistics (GetSafeFloorStatistics) XML payload with checksum.
+        """Build a measurement history XML payload (e.g. GetSafeFloorStatistics) with checksum.
 
         Args:
             session_id: Active session ID
             device_id: Device ID to query (UUID)
-            measurement_type: 1 = temperature, 2 = humidity
-            unit: Unit of the measurement ("°C" or "%"). Required by the API,
-                without it the response is empty.
-            report_type: 1 = week, 2 = month, 3 = year (aggregated),
-                4 = raw measurements of the last 6 days
+            measurement_type: Measurement "t" (e.g. 1 = temperature)
+            report_type: Report type "rtyp" (e.g. 4 = raw measurements)
+            unit: Unit of the measurement (e.g. "°C"), without it the response is empty
 
         Returns:
             XML string with checksum
         """
-        lang, reg = self._compute_locale_lang_reg()
+        # Language and region as sent by the app: "de-DE" -> lg="de" rg="DE"
+        lang, reg = _SYR_CONNECT_CLIENT_OS_LANGUAGE.split("-")
         payload = (
             f'<?xml version="1.0" encoding="utf-8"?><sc>'
             f'<si v="{escape(self.app_version)}"/>'
             f'<us ug="{escape(session_id)}"/>'
             f'<col><dcl dclg="{escape(device_id)}">'
-            f'<sh t="{int(measurement_type)}" rtyp="{int(report_type)}" lg="{escape(lang)}" rg="{escape(reg)}" '
-            f'unit="{escape(unit)}"/>'
+            f'<sh t="{measurement_type}" rtyp="{report_type}" lg="{lang}" rg="{reg}" unit="{escape(unit)}"/>'
             f'</dcl></col>'
             f'</sc>'
         )

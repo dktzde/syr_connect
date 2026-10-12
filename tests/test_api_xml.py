@@ -1,6 +1,7 @@
 """Test the SYR Connect API client."""
 from datetime import UTC, datetime, timedelta
-from unittest.mock import MagicMock, patch
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiohttp
 import pytest
@@ -424,3 +425,44 @@ async def test_get_statistics_with_expired_session(api_client):
         # Should have called login due to expired session
         mock_login.assert_called_once()
 
+
+
+SAFEFLOOR_STATISTICS_URL = "WebServices/SyrControlWebServiceTest2.asmx/GetSafeFloorStatistics"
+SAFEFLOOR_TEMPERATURE_XML = (
+    Path(__file__).parent / "fixtures/xml/SyrSafeFloor_GetSafeFloorStatistics_Temperature.xml"
+).read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    ("api_base_url", "expected_url"),
+    [
+        (None, f"https://syrconnect.de/{SAFEFLOOR_STATISTICS_URL}"),
+        ("https://api.conelclearpro.de/", f"https://api.conelclearpro.de/{SAFEFLOOR_STATISTICS_URL}"),
+    ],
+    ids=["default", "conel_clear_pro"],
+)
+async def test_get_device_history(mock_session, api_base_url, expected_url):
+    """The history request is posted to the device's statistics URL of the service and parsed."""
+    client = SyrConnectXmlAPI(mock_session, "test@example.com", "testpassword", api_base_url=api_base_url)
+    client.session_data = "test_session"
+    client.session_expires_at = datetime.now(UTC) + timedelta(minutes=10)
+
+    with patch.object(client.http_client, "post", AsyncMock(return_value=SAFEFLOOR_TEMPERATURE_XML)) as mock_post:
+        result = await client.get_device_history("dclg-1", SAFEFLOOR_STATISTICS_URL, 1, 4, "°C")
+
+    assert len(result) == 9
+    url, data = mock_post.call_args.args
+    assert url == expected_url
+    assert '<sh t="1" rtyp="4" lg="de" rg="DE" unit="°C"/>' in data["xml"]
+
+
+async def test_get_device_history_relogin_and_connection_error(api_client):
+    """An expired session is renewed first; network errors raise SyrConnectConnectionError."""
+    api_client.session_expires_at = datetime.now(UTC) - timedelta(minutes=1)
+    with (
+        patch.object(api_client, "login", AsyncMock(return_value=True)) as mock_login,
+        patch.object(api_client.http_client, "post", AsyncMock(side_effect=aiohttp.ClientError("boom"))),
+        pytest.raises(SyrConnectConnectionError),
+    ):
+        await api_client.get_device_history("dclg-1", SAFEFLOOR_STATISTICS_URL, 2, 4, "%")
+    mock_login.assert_awaited_once()

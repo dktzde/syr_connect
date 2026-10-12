@@ -9,6 +9,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_USERNAME, Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
+from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .config_flow import ConfigFlow
@@ -19,9 +20,10 @@ from .const import (
     API_TYPE_XML,
     CONF_API_TYPE,
     CONF_HOST,
+    DOMAIN,
 )
-from .coordinator import SyrConnectDataUpdateCoordinator, async_remove_safefloor_history_store
-from .helpers import cleanup_removed_devices, get_default_scan_interval_for_entry
+from .coordinator import SyrConnectDataUpdateCoordinator
+from .helpers import async_clear_history_statistics, cleanup_removed_devices, get_default_scan_interval_for_entry
 from .migrations import (
     v1_to_v2_update_kwargs,
     v2_to_v3_fix_flo_unit,
@@ -227,8 +229,17 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 
 async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Delete stored data of a removed config entry (SafeFloor history fetch state)."""
-    await async_remove_safefloor_history_store(hass, entry.entry_id)
+    """Delete the measurement history statistics of the devices removed with this entry.
+
+    Home Assistant deletes the devices that belong to no other config entry right
+    after this call; devices shared with another entry are kept, and so are their
+    statistics.
+    """
+    device_ids: list[str] = []
+    for device in dr.async_entries_for_config_entry(dr.async_get(hass), entry.entry_id):
+        if device.config_entries == {entry.entry_id}:
+            device_ids.extend(identifier for domain, identifier in device.identifiers if domain == DOMAIN)
+    async_clear_history_statistics(hass, device_ids)
 
 
 async def async_options_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:

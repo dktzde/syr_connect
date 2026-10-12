@@ -365,16 +365,16 @@ class ResponseParser:
         return self._flatten_attributes(parsed['sc'])
 
     @staticmethod
-    def parse_safefloor_statistics_response(xml_response: str) -> list[tuple[datetime, float]]:
-        """Parse a SafeFloor statistics (GetSafeFloorStatistics) response.
+    def parse_device_history_response(xml_response: str) -> list[tuple[datetime, float]]:
+        """Parse a measurement history response (e.g. GetSafeFloorStatistics, report type 4).
 
-        Expected structure (report type 4 = raw measurements)::
+        Expected structure (timestamps in UTC)::
 
             <sc><col><dcl dclg="..."><sh ... unit="°C"><sths>
               <sth dt="2026-09-28 14:45:27" v="15.8"/> ...
             </sths></sh></dcl></col></sc>
 
-        The timestamps are UTC. Entries without a valid timestamp or value are skipped.
+        Entries without a valid timestamp or value are skipped.
 
         Args:
             xml_response: XML response string
@@ -391,26 +391,26 @@ class ResponseParser:
         except etree.ParseError as err:
             raise ValueError(f"Invalid XML response: {err}") from err
 
+        # E.g. an unknown dclg: <sc><msg v="An error has occurred." .../></sc>
         msg = root.find("msg")
         if msg is not None:
-            raise ValueError(f"SafeFloor statistics API returned message: {msg.get('v') or msg.attrib}")
+            raise ValueError(f"History request failed: {msg.get('v')}")
 
         measurements: list[tuple[datetime, float]] = []
         for sth in root.iter("sth"):
             raw_dt = (sth.get("dt") or "").strip()
-            raw_value = (sth.get("v") or "").strip().replace(",", ".")
+            raw_value = (sth.get("v") or "").replace(",", ".")
             try:
                 timestamp = datetime.strptime(raw_dt, "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
                 value = float(raw_value)
-                if not math.isfinite(value):
-                    raise ValueError("not a finite number")
             except ValueError:
-                _LOGGER.debug("Skipping SafeFloor measurement with invalid data: dt=%r v=%r", raw_dt, raw_value)
+                _LOGGER.debug("Skipping measurement with invalid data: dt=%r v=%r", raw_dt, raw_value)
                 continue
-            measurements.append((timestamp, value))
+            # float() also accepts "nan" and "inf", which the statistics can not store
+            if math.isfinite(value):
+                measurements.append((timestamp, value))
 
-        measurements.sort()
-        return measurements
+        return sorted(measurements)
 
     @staticmethod
     def _flatten_attributes(data: dict | list, prefix: str = "") -> dict[str, Any]:

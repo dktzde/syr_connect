@@ -13,4 +13,9 @@ every model's keys. Models without a file here keep using the global
 const.py allowlists unchanged.
 
 See const.py's `_SYR_CONNECT_<PLATFORM>_KNOWN_KEYS` for the global fallback allowlists these override.
+
+A module may also define the measurement history request of its model
+(`_SYR_CONNECT_API_XML_DEVICE_GET_STATISTICS_URL`, `..._REPORT_TYPE` and
+`..._TYPES`, see safefloor.py). The coordinator then imports the measurements
+as long-term statistics.
 """

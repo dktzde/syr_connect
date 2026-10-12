@@ -7,10 +7,13 @@ from unittest.mock import MagicMock, patch
 
 from custom_components.syr_connect import helpers
 from custom_components.syr_connect.const import API_TYPE_JSON
+from custom_components.syr_connect.devices import safefloor
 from custom_components.syr_connect.helpers import (
     build_device_info,
     build_entity_id,
+    build_statistic_id,
     get_current_mac,
+    get_model_device_module,
     get_sensor_ab_value,
     get_sensor_ala_map,
     get_sensor_avo_value,
@@ -110,6 +113,59 @@ def test_cleanup_removed_devices_keeps_current_device() -> None:
         helpers.cleanup_removed_devices(hass, {"devices": [{"id": "CURRENT_DEV"}]}, "entry1")
 
     device_registry.async_update_device.assert_not_called()
+
+
+def test_cleanup_removed_devices_clears_statistics_of_deleted_device() -> None:
+    """A device detached from its last config entry is deleted, and so are its statistics."""
+    hass = MagicMock()
+    device_registry = MagicMock()
+    device_registry.async_update_device.return_value = None  # the device was deleted
+    stale_entry = SimpleNamespace(id="registry_entry_id", identifiers={(helpers.DOMAIN, "STALE_DEV")})
+
+    with (
+        patch("custom_components.syr_connect.helpers.dr.async_get", return_value=device_registry),
+        patch(
+            "custom_components.syr_connect.helpers.dr.async_entries_for_config_entry",
+            return_value=[stale_entry],
+        ),
+        patch("custom_components.syr_connect.helpers.async_clear_history_statistics") as mock_clear,
+    ):
+        helpers.cleanup_removed_devices(hass, {"devices": []}, "entry1")
+
+    mock_clear.assert_called_once_with(hass, ["STALE_DEV"])
+
+
+def test_async_clear_history_statistics() -> None:
+    """The history statistics of all known keys are cleared; nothing without devices or recorder."""
+    hass = MagicMock()
+    hass.config.components = {"recorder"}
+
+    with patch("custom_components.syr_connect.helpers.get_instance") as mock_get_instance:
+        helpers.async_clear_history_statistics(hass, ["123456789"])
+        helpers.async_clear_history_statistics(hass, [])
+        hass.config.components = set()
+        helpers.async_clear_history_statistics(hass, ["123456789"])
+
+    clear = mock_get_instance.return_value.async_clear_statistics
+    clear.assert_called_once()
+    assert sorted(clear.call_args.args[0]) == [
+        "syr_connect:123456789_getcel_history",
+        "syr_connect:123456789_gethmd_history",
+    ]
+
+
+def test_build_statistic_id() -> None:
+    """External statistic IDs have a colon after the domain and are lower case."""
+    assert build_statistic_id("203406210", "getCEL") == "syr_connect:203406210_getcel_history"
+    assert build_statistic_id("43AAA12-x", "getHMD") == "syr_connect:43aaa12_x_gethmd_history"
+
+
+def test_get_model_device_module() -> None:
+    """The device module is selected by device_file, then by name."""
+    assert get_model_device_module({"name": "safefloorrwc", "device_file": "safefloor"}) is safefloor
+    assert get_model_device_module({"name": "safefloor"}) is safefloor
+    assert get_model_device_module({"name": "unknown"}) is None
+    assert get_model_device_module({}) is None
 
 
 def test_cleanup_removed_devices_handles_exception() -> None:

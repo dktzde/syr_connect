@@ -1197,7 +1197,14 @@ SafeFloor sensors are battery powered. They measure temperature and humidity eve
 
 - An unknown `dclg` returns `<sc><msg v="An error has occurred." hl="Error" mtid="1" /></sc>`.
 - Only the last 6 days are returned. With an upload interval (`getRCP`) above 6 days the older measurements of an upload can not be retrieved with `rtyp="4"`.
-- The integration fetches the raw measurements whenever `getSRN_dt` changes (new upload), after a restart and at least once a day, and imports them as external statistics `syr_connect:<serial>_temperature` / `syr_connect:<serial>_humidity` (one row per hour: the measured value, hours without a measurement take over the hour before; see README). The sensor entities themselves keep showing the last uploaded value.
+
+### Use in the integration
+
+- Models whose device module (`custom_components/syr_connect/devices/<model>.py`) defines `_SYR_CONNECT_API_XML_DEVICE_GET_STATISTICS_URL` get their measurement history imported (currently SafeFloor). The module also defines the report type and the measurement type `t` per sensor key; the unit comes from `_SYR_CONNECT_SENSOR_UNIT`. `lg`/`rg` are taken from `_SYR_CONNECT_CLIENT_OS_LANGUAGE`, as sent by the app.
+- When: `getSRN_dt` (time of the last upload) comes with every `GetDeviceCollectionStatus`. The history is fetched once after the start of Home Assistant and then only when `getSRN_dt` changes, one request per measurement type. A failed fetch is retried after 3 hours. There is no polling.
+- Where: external statistics `syr_connect:<serial>_<key>_history` (e.g. `syr_connect:123456789_getcel_history`), source `syr_connect`. External statistic IDs need the colon; IDs like `syr_connect_...` are reserved for statistics of entities. The statistics are deleted together with the device or the config entry.
+- Why external statistics: `async_add_external_statistics` is the Home Assistant API for values with a past timestamp (also used by e.g. opower and tibber). The state history of an entity can not be changed, and the long-term statistics of the sensor entities can not be written: the recorder compiles each of their hours exactly once and fails for an hour that already has a row. The sensor entities keep showing the last uploaded value.
+- Rows: one row per hour from the first to the last measurement. An hour with measurements gets their mean, min and max; an hour without a measurement repeats the hour before, because the statistics graph card draws a gap between rows that do not follow each other. Nothing is interpolated. Importing the same 6 days again overwrites the same rows.
 
 ## Further information
 
