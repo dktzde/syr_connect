@@ -34,6 +34,7 @@ from .const import (
     DOMAIN,
 )
 from .devices import (
+    HistoryRequest,
     lex,
     lexplus10s,
     lexplus10sl,
@@ -79,7 +80,8 @@ _DEVICE_MODULES: dict[str, ModuleType] = {
 _HISTORY_KEYS: set[str] = {
     key
     for device_module in _DEVICE_MODULES.values()
-    for key in getattr(device_module, "_SYR_CONNECT_API_XML_DEVICE_GET_STATISTICS_TYPES", {})
+    if hasattr(device_module, "HISTORY_REQUEST")
+    for key in device_module.HISTORY_REQUEST.measurement_types
 }
 
 
@@ -294,6 +296,15 @@ def get_model_device_module(model_info: dict[str, Any]) -> ModuleType | None:
     return _DEVICE_MODULES.get(name) if name else None
 
 
+def get_model_history_request(model_info: dict[str, Any]) -> HistoryRequest | None:
+    """Return the measurement history request of the detected model, or None if it has none.
+
+    Args:
+        model_info: Result of `models.detect_model()`.
+    """
+    return getattr(get_model_device_module(model_info), "HISTORY_REQUEST", None)
+
+
 def get_model_known_keys(model_info: dict[str, Any], platform: str, global_known_keys: set[str]) -> set[str]:
     """Return the known-keys allowlist for a platform, scoped to the detected model.
 
@@ -357,6 +368,10 @@ def cleanup_removed_devices(
     """
     try:
         current_ids = {d["id"] for d in (coordinator_data or {}).get("devices", []) if d.get("id")}
+        if not current_ids:
+            # No device list (e.g. the cloud failed at startup): nothing to compare against.
+            # Deleting would remove all devices and their statistics, which can not be restored.
+            return
         device_registry = dr.async_get(hass)
         deleted_ids = []
         for device_entry in dr.async_entries_for_config_entry(device_registry, entry_id):

@@ -45,11 +45,12 @@ from .const import (
     CONF_SERVICE,
     DOMAIN,
 )
+from .devices import HistoryRequest
 from .exceptions import SyrConnectAuthError, SyrConnectConnectionError
 from .helpers import (
     build_statistic_id,
     get_default_scan_interval_for_entry,
-    get_model_device_module,
+    get_model_history_request,
     get_sensor_iwh_value,
 )
 from .models import MODEL_SIGNATURES, detect_model
@@ -148,10 +149,12 @@ class SyrConnectDataUpdateCoordinator(DataUpdateCoordinator):
         # Keep aiohttp session for optional JSON API usage per-device
         self._session = session
 
-        # Measurement history (see _async_update_device_history), keyed by device ID:
-        # getSRN_dt of the last imported upload, and the time a failed fetch is retried
+        # Measurement history (see _history_request_due), keyed by device ID: getSRN_dt of the
+        # last imported upload, and the time a failed fetch is retried. The import runs as a
+        # background task, at most one at a time.
         self._history_imported_uploads: dict[str, str] = {}
         self._history_retry_at: dict[str, datetime] = {}
+        self._history_task: asyncio.Task[None] | None = None
 
     async def _async_update_data(self) -> dict[str, Any]:
         """Fetch data from API.
@@ -220,9 +223,12 @@ class SyrConnectDataUpdateCoordinator(DataUpdateCoordinator):
                         all_devices.append(device_result)
 
             # Devices that upload several measurements at once (SafeFloor): import them as
-            # long-term statistics. Does nothing for other models, never fails the update.
-            for device in all_devices:
-                await self._async_update_device_history(device)
+            # long-term statistics in the background, so a slow request never delays the update
+            due = [(device, request) for device in all_devices if (request := self._history_request_due(device))]
+            if due and (self._history_task is None or self._history_task.done()):
+                self._history_task = self.hass.async_create_background_task(
+                    self._async_import_device_histories(due), f"{DOMAIN} measurement history"
+                )
 
             _LOGGER.debug("Update cycle completed: %d device(s) total", len(all_devices))
             return {
@@ -334,70 +340,79 @@ class SyrConnectDataUpdateCoordinator(DataUpdateCoordinator):
 
             return device
 
-    async def _async_update_device_history(self, device: dict[str, Any]) -> None:
-        """Import the measurement history of a device once per new upload.
+    def _history_request_due(self, device: dict[str, Any]) -> HistoryRequest | None:
+        """Return the history request of a device if its measurement history is due.
 
         Battery powered devices (SafeFloor) measure regularly but upload all measurements at
-        once every few days, so their status only carries the latest one. If the device
-        module of the model defines a statistics request (see devices/safefloor.py), the
-        measurements the cloud still holds are imported as long-term statistics.
-
-        getSRN_dt (time of the last upload) comes with every status, so a new upload is
-        detected without an extra request: the history is fetched once after the start and
-        then only when getSRN_dt changes. A failed fetch is retried after a few hours; the
-        cloud keeps the measurements for 6 days. Failures are logged, never raised.
+        once every few days, so their status only carries the latest one. getSRN_dt (time of
+        the last upload) comes with every status, so a new upload is detected without an
+        extra request: the history is fetched once after the start and then only when
+        getSRN_dt changes. After a failed fetch it waits a few hours; the cloud keeps the
+        measurements for 6 days.
 
         Args:
             device: Device dictionary including its status
+
+        Returns:
+            The request defined by the device module of the model, or None if nothing is due
         """
-        if isinstance(self.api, SyrConnectJsonAPI) or "recorder" not in self.hass.config.components:
-            return  # The history comes from the cloud and is stored by the recorder
-        device_id = device["id"]
+        if "recorder" not in self.hass.config.components:
+            return None  # Long-term statistics are stored by the recorder
         status = device.get("status") or {}
-        device_module = get_model_device_module(detect_model(status))
-        if device_module is None or not hasattr(device_module, "_SYR_CONNECT_API_XML_DEVICE_GET_STATISTICS_URL"):
-            return  # Model without measurement history
-
         upload = status.get("getSRN_dt")
-        if not upload or upload == self._history_imported_uploads.get(device_id):
-            return  # No new upload since the last import
-        now = dt_util.utcnow()
-        retry_at = self._history_retry_at.get(device_id)
-        if retry_at is not None and now < retry_at:
-            return  # A failed fetch is retried later
+        if not upload or upload == self._history_imported_uploads.get(device["id"]):
+            return None  # No new upload since the last import
+        retry_at = self._history_retry_at.get(device["id"])
+        if retry_at is not None and dt_util.utcnow() < retry_at:
+            return None  # A failed fetch is retried later
+        return get_model_history_request(detect_model(status))  # None for models without history
 
+    async def _async_import_device_histories(self, due: list[tuple[dict[str, Any], HistoryRequest]]) -> None:
+        """Fetch the measurement history of devices and import it as long-term statistics.
+
+        Runs as a background task (see _async_update_data). Failures are logged and retried
+        later (see _history_request_due), never raised.
+
+        Args:
+            due: Devices including their status, each with the history request of its model
+        """
+        if isinstance(self.api, SyrConnectJsonAPI):
+            return  # History requests are cloud API requests
         # The statistics are named like the sensors, e.g. "Floor sensor Temperature history"
         translations = await async_get_translations(self.hass, self.hass.config.language, "entity", {DOMAIN})
-        try:
-            for key, measurement_type in device_module._SYR_CONNECT_API_XML_DEVICE_GET_STATISTICS_TYPES.items():
-                unit = _SYR_CONNECT_SENSOR_UNIT[key]
-                measurements = await self.api.get_device_history(
-                    device.get("dclg", device_id),
-                    device_module._SYR_CONNECT_API_XML_DEVICE_GET_STATISTICS_URL,
-                    measurement_type,
-                    device_module._SYR_CONNECT_API_XML_DEVICE_GET_STATISTICS_REPORT_TYPE,
-                    unit,
-                )
-                sensor_name = translations.get(f"component.{DOMAIN}.entity.sensor.{key.lower()}.name", key)
-                async_import_history(
-                    self.hass,
-                    build_statistic_id(device_id, key),
-                    f"{device.get('name') or device_id} {sensor_name} history",
-                    unit,
-                    measurements,
-                )
-        except (SyrConnectAuthError, SyrConnectConnectionError, ValueError, HomeAssistantError) as err:
-            self._history_retry_at[device_id] = now + timedelta(hours=_SYR_CONNECT_API_XML_STATISTICS_RETRY_HOURS)
-            _LOGGER.warning(
-                "Device %s: failed to fetch the measurement history, retrying in %d hours: %s",
-                device_id,
-                _SYR_CONNECT_API_XML_STATISTICS_RETRY_HOURS,
-                err,
-            )
-            return
 
-        self._history_imported_uploads[device_id] = upload
-        self._history_retry_at.pop(device_id, None)
+        for device, request in due:
+            device_id = device["id"]
+            try:
+                for key, measurement_type in request.measurement_types.items():
+                    unit = _SYR_CONNECT_SENSOR_UNIT[key]
+                    measurements = await self.api.get_device_history(
+                        device.get("dclg", device_id), request.url, measurement_type, request.report_type, unit
+                    )
+                    sensor_name = translations.get(f"component.{DOMAIN}.entity.sensor.{key.lower()}.name", key)
+                    async_import_history(
+                        self.hass,
+                        build_statistic_id(device_id, key),
+                        f"{device.get('name') or device_id} {sensor_name} history",
+                        unit,
+                        measurements,
+                    )
+            except (SyrConnectAuthError, SyrConnectConnectionError, ValueError, HomeAssistantError) as err:
+                # Warn once, then only debug while the failure persists
+                log = _LOGGER.debug if device_id in self._history_retry_at else _LOGGER.warning
+                self._history_retry_at[device_id] = dt_util.utcnow() + timedelta(
+                    hours=_SYR_CONNECT_API_XML_STATISTICS_RETRY_HOURS
+                )
+                log(
+                    "Device %s: failed to import the measurement history, retrying in %d hours: %s",
+                    device_id,
+                    _SYR_CONNECT_API_XML_STATISTICS_RETRY_HOURS,
+                    err,
+                )
+                continue
+
+            self._history_imported_uploads[device_id] = device["status"]["getSRN_dt"]
+            self._history_retry_at.pop(device_id, None)
 
     def _get_device_dclg_from_srn(self, device_id: str) -> str | None:
         """Return the DCLG (Device Collection Group UUID) for the given device serial number.

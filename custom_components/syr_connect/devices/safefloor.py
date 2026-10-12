@@ -22,6 +22,8 @@ used, move them into SENSOR_KNOWN_KEYS below (after adding them to the
 global const.py allowlist first).
 """
 
+from . import HistoryRequest
+
 SENSOR_KNOWN_KEYS = {
     # --- Connectivity ---
     "dst",
@@ -68,11 +70,11 @@ VALVE_KNOWN_KEYS: set[str] = set()
 # (e.g. every 4 days), so the status only carries the latest measurement. GetSafeFloorStatistics
 # returns the raw measurements of the last 6 days, which the coordinator imports as long-term
 # statistics (see docs/syrconnect-protocol.md, "SafeFloor measurement history").
-_SYR_CONNECT_API_XML_DEVICE_GET_STATISTICS_URL = "WebServices/SyrControlWebServiceTest2.asmx/GetSafeFloorStatistics"
-# Report type "rtyp": 4 = raw measurements with timestamps (1-3 are week/month/year aggregates)
-_SYR_CONNECT_API_XML_DEVICE_GET_STATISTICS_REPORT_TYPE = 4
-# Sensor key -> measurement type "t". The unit comes from _SYR_CONNECT_SENSOR_UNIT.
-_SYR_CONNECT_API_XML_DEVICE_GET_STATISTICS_TYPES = {
-    "getCEL": 1,  # Temperature
-    "getHMD": 2,  # Humidity
-}
+HISTORY_REQUEST = HistoryRequest(
+    url="WebServices/SyrControlWebServiceTest2.asmx/GetSafeFloorStatistics",
+    report_type=4,  # Raw measurements with timestamps (1-3 are week/month/year aggregates)
+    measurement_types={
+        "getCEL": 1,  # Temperature
+        "getHMD": 2,  # Humidity
+    },
+)

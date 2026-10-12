@@ -1,4 +1,5 @@
 """Test the SYR Connect coordinator."""
+import asyncio
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -29,6 +30,7 @@ from custom_components.syr_connect.const import (
     CONF_MODEL,
     CONF_SERVICE,
 )
+from custom_components.syr_connect.devices import safefloor
 from custom_components.syr_connect.coordinator import (
     SyrConnectDataUpdateCoordinator,
     async_import_history,
@@ -1484,6 +1486,15 @@ def _history_coordinator(
     return coordinator, mock_api
 
 
+async def _refresh(hass: HomeAssistant, coordinator: SyrConnectDataUpdateCoordinator, first: bool = False) -> None:
+    """Refresh and wait for the history import running in the background."""
+    if first:
+        await coordinator.async_config_entry_first_refresh()
+    else:
+        await coordinator.async_refresh()
+    await hass.async_block_till_done(wait_background_tasks=True)
+
+
 async def test_coordinator_history_imported_once_per_upload(
     hass: HomeAssistant, setup_in_progress_config_entry
 ) -> None:
@@ -1493,7 +1504,7 @@ async def test_coordinator_history_imported_once_per_upload(
     coordinator, mock_api = _history_coordinator(hass, setup_in_progress_config_entry, _safefloor_status(), history)
 
     with patch("custom_components.syr_connect.coordinator.async_import_history") as mock_import:
-        await coordinator.async_config_entry_first_refresh()
+        await _refresh(hass, coordinator, first=True)
         assert [c.args for c in history.await_args_list] == [
             (SAFEFLOOR_DCLG, SAFEFLOOR_STATISTICS_URL, 1, 4, "°C"),
             (SAFEFLOOR_DCLG, SAFEFLOOR_STATISTICS_URL, 2, 4, "%"),
@@ -1504,25 +1515,48 @@ async def test_coordinator_history_imported_once_per_upload(
         ]
 
         # Same upload: nothing is fetched
-        await coordinator.async_refresh()
+        await _refresh(hass, coordinator)
         assert history.await_count == 2
 
         # New upload: fetched again
         mock_api.get_device_status.return_value = _safefloor_status(UPLOAD_2)
-        await coordinator.async_refresh()
+        await _refresh(hass, coordinator)
         assert history.await_count == 4
         assert coordinator.last_update_success
 
 
-async def test_coordinator_history_failure_is_retried_later(
+async def test_coordinator_history_does_not_delay_the_update(
     hass: HomeAssistant, setup_in_progress_config_entry
 ) -> None:
-    """A failed fetch keeps the update working and is retried after 3 hours."""
+    """The history is imported in the background, at most one import at a time."""
+    release = asyncio.Event()
+
+    async def slow_history(*_args) -> list:
+        await release.wait()
+        return []
+
+    history = AsyncMock(side_effect=slow_history)
+    coordinator, _ = _history_coordinator(hass, setup_in_progress_config_entry, _safefloor_status(), history)
+
+    await coordinator.async_config_entry_first_refresh()
+    await coordinator.async_refresh()
+    assert coordinator.last_update_success
+    assert history.await_count == 1  # the second refresh does not start another import
+
+    release.set()
+    await hass.async_block_till_done(wait_background_tasks=True)
+    assert coordinator._history_imported_uploads == {SAFEFLOOR_SERIAL: UPLOAD_1}
+
+
+async def test_coordinator_history_failure_is_retried_later(
+    hass: HomeAssistant, setup_in_progress_config_entry, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A failed fetch keeps the update working, is logged once and retried after 3 hours."""
     history = AsyncMock(side_effect=SyrConnectConnectionError("cloud down"))
     coordinator, _ = _history_coordinator(hass, setup_in_progress_config_entry, _safefloor_status(), history)
 
     with patch("custom_components.syr_connect.coordinator.async_import_history") as mock_import:
-        await coordinator.async_config_entry_first_refresh()
+        await _refresh(hass, coordinator, first=True)
         assert coordinator.last_update_success
         assert coordinator.data["devices"][0]["status"]["getCEL"] == "158"
         mock_import.assert_not_called()
@@ -1530,15 +1564,22 @@ async def test_coordinator_history_failure_is_retried_later(
         assert timedelta(hours=2, minutes=59) < retry_in <= timedelta(hours=3)
 
         # Within the retry delay nothing is fetched
-        await coordinator.async_refresh()
+        await _refresh(hass, coordinator)
         assert history.await_count == 1
 
-        # After the retry delay it is fetched again
+        # After the retry delay it is fetched again; the repeated failure is not warned again
+        coordinator._history_retry_at[SAFEFLOOR_SERIAL] = datetime.now(UTC) - timedelta(seconds=1)
+        await _refresh(hass, coordinator)
+        assert history.await_count == 2
+        warnings = [r for r in caplog.records if r.levelname == "WARNING" and "measurement history" in r.message]
+        assert len(warnings) == 1
+
+        # Success
         history.side_effect = None
         history.return_value = []
         coordinator._history_retry_at[SAFEFLOOR_SERIAL] = datetime.now(UTC) - timedelta(seconds=1)
-        await coordinator.async_refresh()
-        assert history.await_count == 3
+        await _refresh(hass, coordinator)
+        assert history.await_count == 4
         assert coordinator._history_retry_at == {}
         assert coordinator._history_imported_uploads == {SAFEFLOOR_SERIAL: UPLOAD_1}
 
@@ -1546,7 +1587,7 @@ async def test_coordinator_history_failure_is_retried_later(
 @pytest.mark.parametrize(
     ("status", "recorder"),
     [
-        ({"getSRN": "210AAA12345", "getPRS": "50"}, True),
+        ({"getSRN": "210AAA12345", "getSRN_dt": UPLOAD_1, "getPRS": "50"}, True),
         ({}, True),
         (_safefloor_status(upload=None), True),
         (_safefloor_status(), False),
@@ -1560,9 +1601,10 @@ async def test_coordinator_history_not_fetched(
     history = AsyncMock(return_value=[])
     coordinator, _ = _history_coordinator(hass, setup_in_progress_config_entry, status, history, recorder)
 
-    await coordinator.async_config_entry_first_refresh()
+    await _refresh(hass, coordinator, first=True)
 
     assert coordinator.last_update_success
+    assert coordinator._history_task is None
     history.assert_not_awaited()
 
 
@@ -1572,10 +1614,9 @@ async def test_coordinator_history_not_fetched_for_json_api(
     """The local JSON API has no history request."""
     coordinator, _ = _history_coordinator(hass, setup_in_progress_config_entry, _safefloor_status(), AsyncMock())
     coordinator.api = MagicMock(spec=SyrConnectJsonAPI)
+    device = {"id": SAFEFLOOR_SERIAL, "name": "Floor", "status": _safefloor_status()}
 
-    await coordinator._async_update_device_history(
-        {"id": SAFEFLOOR_SERIAL, "name": "Floor", "status": _safefloor_status()}
-    )
+    await coordinator._async_import_device_histories([(device, safefloor.HISTORY_REQUEST)])
 
     assert coordinator._history_imported_uploads == {}
 

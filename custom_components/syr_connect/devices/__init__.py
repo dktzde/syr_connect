@@ -14,8 +14,18 @@ const.py allowlists unchanged.
 
 See const.py's `_SYR_CONNECT_<PLATFORM>_KNOWN_KEYS` for the global fallback allowlists these override.
 
-A module may also define the measurement history request of its model
-(`_SYR_CONNECT_API_XML_DEVICE_GET_STATISTICS_URL`, `..._REPORT_TYPE` and
-`..._TYPES`, see safefloor.py). The coordinator then imports the measurements
+A module may also define `HISTORY_REQUEST`, the measurement history request
+of its model (see safefloor.py). The coordinator then imports the measurements
 as long-term statistics.
 """
+
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class HistoryRequest:
+    """Measurement history request of a model (cloud API)."""
+
+    url: str  # Endpoint path relative to the API base URL
+    report_type: int  # Report type "rtyp"
+    measurement_types: dict[str, int]  # Sensor key -> measurement type "t" (unit from _SYR_CONNECT_SENSOR_UNIT)

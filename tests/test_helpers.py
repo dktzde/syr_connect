@@ -14,6 +14,7 @@ from custom_components.syr_connect.helpers import (
     build_statistic_id,
     get_current_mac,
     get_model_device_module,
+    get_model_history_request,
     get_sensor_ab_value,
     get_sensor_ala_map,
     get_sensor_avo_value,
@@ -130,9 +131,19 @@ def test_cleanup_removed_devices_clears_statistics_of_deleted_device() -> None:
         ),
         patch("custom_components.syr_connect.helpers.async_clear_history_statistics") as mock_clear,
     ):
-        helpers.cleanup_removed_devices(hass, {"devices": []}, "entry1")
+        helpers.cleanup_removed_devices(hass, {"devices": [{"id": "CURRENT_DEV"}]}, "entry1")
 
     mock_clear.assert_called_once_with(hass, ["STALE_DEV"])
+
+
+def test_cleanup_removed_devices_without_device_list() -> None:
+    """Without a device list (e.g. the cloud failed at startup) nothing is detached or deleted."""
+    hass = MagicMock()
+    with patch("custom_components.syr_connect.helpers.dr.async_get") as mock_get_registry:
+        helpers.cleanup_removed_devices(hass, {"devices": []}, "entry1")
+        helpers.cleanup_removed_devices(hass, None, "entry1")
+
+    mock_get_registry.assert_not_called()
 
 
 def test_async_clear_history_statistics() -> None:
@@ -160,6 +171,13 @@ def test_build_statistic_id() -> None:
     assert build_statistic_id("43AAA12-x", "getHMD") == "syr_connect:43aaa12_x_gethmd_history"
 
 
+def test_get_model_history_request() -> None:
+    """Only models whose device module defines a history request have one."""
+    assert get_model_history_request({"name": "safefloor"}) is safefloor.HISTORY_REQUEST
+    assert get_model_history_request({"name": "lexplus10s"}) is None
+    assert get_model_history_request({}) is None
+
+
 def test_get_model_device_module() -> None:
     """The device module is selected by device_file, then by name."""
     assert get_model_device_module({"name": "safefloorrwc", "device_file": "safefloor"}) is safefloor
@@ -173,7 +191,7 @@ def test_cleanup_removed_devices_handles_exception() -> None:
     hass = MagicMock()
     with patch("custom_components.syr_connect.helpers.dr.async_get", side_effect=RuntimeError("boom")):
         # Should not raise
-        helpers.cleanup_removed_devices(hass, {"devices": []}, "entry1")
+        helpers.cleanup_removed_devices(hass, {"devices": [{"id": "CURRENT_DEV"}]}, "entry1")
 
 
 def test_get_current_mac_priorities_additional():
